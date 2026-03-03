@@ -15,8 +15,8 @@ public sealed class ExecuteQueryRequestPayload
     [Required, MinLength(1)]
     public List<QueryItem> Queries { get; init; }
 
-    [Required, EmailAddress]
-    public string ImpersonatedUserName { get; init; }
+    [EmailAddress]
+    public string? ImpersonatedUserName { get; init; }
 
 }
 
@@ -123,8 +123,8 @@ public class Function : IHttpFunction
         // Get the necessary parameters from request body.
         // The body must have a JSON object with the following properties:
         // - queries: an array of query objects with at least one "query" property containing the DAX query to execute
-        // - impersonatedUserName: the user to impersonate
-        // If any of these are missing, return a 400 Bad Request response
+        // - impersonatedUserName: optional user to impersonate (can be omitted, null, or empty)
+        // If queries are missing, return a 400 Bad Request response
         if (string.IsNullOrWhiteSpace(bodyRaw))
         {
 
@@ -150,19 +150,13 @@ public class Function : IHttpFunction
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(body?.ImpersonatedUserName))
+        // Create ADOMD connection.
+        // EffectiveUserName is only included when a non-empty impersonatedUserName is provided.
+        string connectionString = $"Data Source={xmlaEndpoint};User ID=app:{clientId}@{tenantId};Password={clientSecret};Catalog={datasetName};";
+        if (!string.IsNullOrWhiteSpace(body.ImpersonatedUserName))
         {
-            var errorResponse = new
-            {
-                error = "Invalid body",
-                detail = "Request body must contain ImpersonatedUserName"
-            };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
-            return;
+            connectionString += $"EffectiveUserName={body.ImpersonatedUserName};";
         }
-
-        // Create ADOMD connection
-        string connectionString = $"Data Source={xmlaEndpoint};User ID=app:{clientId}@{tenantId};Password={clientSecret};Catalog={datasetName};EffectiveUserName={body.ImpersonatedUserName};";
         using AdomdConnection connection = new(connectionString);
 
         try
