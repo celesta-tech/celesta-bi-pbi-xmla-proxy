@@ -7,9 +7,14 @@ using System.Text.Json;
 using System.IO;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Text.RegularExpressions;
 
 namespace Celesta.Bi.Pbi.XmlaProxy;
 
+#nullable enable annotations
 public sealed class ExecuteQueryRequestPayload
 {
     [Required, MinLength(1)]
@@ -19,6 +24,7 @@ public sealed class ExecuteQueryRequestPayload
     public string? ImpersonatedUserName { get; init; }
 
 }
+#nullable restore annotations
 
 public sealed class QueryItem
 {
@@ -29,6 +35,30 @@ public sealed class QueryItem
 public class Function : IHttpFunction
 {
     private static readonly string[] AuthScopes = ["https://analysis.windows.net/powerbi/api/.default"];
+    private static readonly RetryPolicySettings RetryPolicy = LoadRetryPolicySettings();
+    private static readonly HttpStatusCode[] TransientHttpStatusCodes =
+    [
+        HttpStatusCode.TooManyRequests,
+        HttpStatusCode.BadGateway,
+        HttpStatusCode.ServiceUnavailable,
+        HttpStatusCode.GatewayTimeout
+    ];
+    private static readonly string[] TransientMessageMarkers =
+    [
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "service unavailable",
+        "gateway",
+        "transport-level error",
+        "connection reset",
+        "forcibly closed",
+        "network",
+        "throttl",
+        "rate limit"
+    ];
+    private static readonly Regex TransientStatusCodeRegex =
+        new(@"\b(429|502|503|504)\b", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
     /// Mimic the PowerBI service endpoint to execute DAX queries against a PowerBI dataset using XMLA endpoint.
@@ -162,7 +192,14 @@ public class Function : IHttpFunction
         try
         {
             // Opening the connection to Pbi XMLA endpoint
-            connection.Open();
+            await ExecuteWithRetryAsync(
+                operation: () =>
+                {
+                    connection.Open();
+                    return true;
+                },
+                operationName: "connection open",
+                cancellationToken: context.RequestAborted);
 
             var allGood = true;
 
@@ -171,12 +208,16 @@ public class Function : IHttpFunction
             // The format return matches the PowerBI executeQueries response
             // Refer to https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/execute-queries for more information
             var results = new List<object>();
-            foreach (var queryItem in body.Queries)
+            for (var queryIndex = 0; queryIndex < body.Queries.Count; queryIndex++)
             {
+                var queryItem = body.Queries[queryIndex];
                 using var command = new AdomdCommand(queryItem.Query, connection);
                 try
                 {
-                    using var reader = command.ExecuteReader();
+                    using var reader = await ExecuteWithRetryAsync(
+                        operation: () => command.ExecuteReader(),
+                        operationName: $"query execution ({queryIndex + 1}/{body.Queries.Count})",
+                        cancellationToken: context.RequestAborted);
                     var rows = new List<Dictionary<string, object>>();
 
                     while (reader.Read())
@@ -254,5 +295,160 @@ public class Function : IHttpFunction
         {
             connection.Close();
         }
+    }
+
+    private static RetryPolicySettings LoadRetryPolicySettings()
+    {
+        const int defaultMaxAttempts = 4;
+        var defaultBackoffDelays = new[]
+        {
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromSeconds(30)
+        };
+
+        var maxAttempts = defaultMaxAttempts;
+        var maxAttemptsRaw = Environment.GetEnvironmentVariable("PBI_XMLA_RETRY_MAX_ATTEMPTS");
+        if (int.TryParse(maxAttemptsRaw, out var parsedMaxAttempts) && parsedMaxAttempts > 0)
+        {
+            maxAttempts = parsedMaxAttempts;
+        }
+
+        var backoffDelays = defaultBackoffDelays;
+        var delaysRaw = Environment.GetEnvironmentVariable("PBI_XMLA_RETRY_BACKOFF_SECONDS");
+        if (!string.IsNullOrWhiteSpace(delaysRaw))
+        {
+            var parsedDelays = delaysRaw
+                .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => int.TryParse(value, out var seconds) ? seconds : -1)
+                .Where(seconds => seconds > 0)
+                .Select(seconds => TimeSpan.FromSeconds(seconds))
+                .ToArray();
+
+            if (parsedDelays.Length > 0)
+            {
+                backoffDelays = parsedDelays;
+            }
+        }
+
+        return new RetryPolicySettings(maxAttempts, backoffDelays);
+    }
+
+    private static async Task<T> ExecuteWithRetryAsync<T>(
+        Func<T> operation,
+        string operationName,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; attempt <= RetryPolicy.MaxAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var result = operation();
+                if (attempt > 1)
+                {
+                    Console.WriteLine($"XMLA retry success: {operationName} succeeded on attempt {attempt}/{RetryPolicy.MaxAttempts}.");
+                }
+                return result;
+            }
+            catch (Exception ex) when (IsTransientFailure(ex) && attempt < RetryPolicy.MaxAttempts)
+            {
+                var delay = GetRetryDelay(attempt);
+                Console.WriteLine(
+                    $"XMLA transient failure: {operationName} attempt {attempt}/{RetryPolicy.MaxAttempts} failed. " +
+                    $"Retrying in {delay.TotalSeconds:F1}s. Reason: {GetShortExceptionMessage(ex)}");
+                await Task.Delay(delay, cancellationToken);
+            }
+            catch (Exception ex) when (IsTransientFailure(ex))
+            {
+                Console.WriteLine(
+                    $"XMLA transient failure exhausted: {operationName} attempt {attempt}/{RetryPolicy.MaxAttempts} failed. " +
+                    $"Reason: {GetShortExceptionMessage(ex)}");
+                throw;
+            }
+        }
+
+        throw new InvalidOperationException("Retry policy exhausted unexpectedly.");
+    }
+
+    private static TimeSpan GetRetryDelay(int failedAttempt)
+    {
+        var delayIndex = Math.Min(failedAttempt - 1, RetryPolicy.BackoffDelays.Length - 1);
+        var baseDelay = RetryPolicy.BackoffDelays[delayIndex];
+        var jitterMilliseconds = Random.Shared.Next(100, 751);
+        return baseDelay + TimeSpan.FromMilliseconds(jitterMilliseconds);
+    }
+
+    private static bool IsTransientFailure(Exception ex)
+    {
+        if (ex is OperationCanceledException)
+        {
+            return false;
+        }
+
+        if (TryGetExceptionInChain<TimeoutException>(ex, out _))
+        {
+            return true;
+        }
+
+        if (TryGetExceptionInChain<System.Net.Sockets.SocketException>(ex, out _))
+        {
+            return true;
+        }
+
+        if (TryGetExceptionInChain<IOException>(ex, out _))
+        {
+            return true;
+        }
+
+        if (TryGetExceptionInChain<System.Net.Http.HttpRequestException>(ex, out var httpRequestException)
+            && httpRequestException.StatusCode.HasValue
+            && TransientHttpStatusCodes.Contains(httpRequestException.StatusCode.Value))
+        {
+            return true;
+        }
+
+        var message = GetShortExceptionMessage(ex).ToLowerInvariant();
+        return TransientMessageMarkers.Any(marker => message.Contains(marker))
+            || TransientStatusCodeRegex.IsMatch(message);
+    }
+
+    private static string GetShortExceptionMessage(Exception ex)
+    {
+        var message = ex.Message ?? ex.GetType().Name;
+        return message.Length <= 220 ? message : $"{message[..220]}...";
+    }
+
+    private static bool TryGetExceptionInChain<TException>(Exception ex, out TException matchingException)
+        where TException : Exception
+    {
+        Exception current = ex;
+        while (current != null)
+        {
+            if (current is TException typedException)
+            {
+                matchingException = typedException;
+                return true;
+            }
+
+            current = current.InnerException;
+        }
+
+        matchingException = null;
+        return false;
+    }
+
+    private sealed class RetryPolicySettings
+    {
+        public RetryPolicySettings(int maxAttempts, TimeSpan[] backoffDelays)
+        {
+            MaxAttempts = maxAttempts;
+            BackoffDelays = backoffDelays.Length > 0 ? backoffDelays : [TimeSpan.FromSeconds(5)];
+        }
+
+        public int MaxAttempts { get; }
+
+        public TimeSpan[] BackoffDelays { get; }
     }
 }
