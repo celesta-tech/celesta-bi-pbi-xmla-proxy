@@ -39,9 +39,11 @@ The `Function.cs` implements an HTTP-triggered Google Cloud Function that:
       "query": "EVALUATE 'Table'"
     }
   ],
-  "impersonatedUserName": "user@domain.com"
+  "impersonatedUserName": null
 }
 ```
+
+`impersonatedUserName` is optional and can be omitted, `null`, or an empty string (`""`).
 
 ## Response Format
 
