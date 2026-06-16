@@ -60,16 +60,35 @@ public class Function : IHttpFunction
     private static readonly Regex TransientStatusCodeRegex =
         new(@"\b(429|502|503|504)\b", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    // ASP.NET Core's StatusCodes class does not define 499 (it is a non-standard
+    // "Client Closed Request" code, originally from nginx), so we declare it here.
+    private const int Status499ClientClosedRequest = 499;
+
+    // Canonical structured-logging severities, promoted by Cloud Logging.
+    private const string SeverityInfo = "INFO";
+    private const string SeverityWarning = "WARNING";
+    private const string SeverityError = "ERROR";
+
     /// <summary>
     /// Mimic the PowerBI service endpoint to execute DAX queries against a PowerBI dataset using XMLA endpoint.
     /// POST https://api.powerbi.com/v1.0/myorg/datasets/{datasetId}/executeQueries
     /// </summary>
     public async Task HandleAsync(HttpContext context)
     {
+        // A per-request correlation id, generated before anything else so it can be
+        // attached to every structured log line and returned to the caller. It is set
+        // as the x-request-id response header immediately, on every code path.
+        var requestId = Guid.NewGuid().ToString();
+        context.Response.Headers["x-request-id"] = requestId;
+
+        Log(SeverityInfo, "XMLA proxy request received.", requestId, "handler_entry");
 
         // Accept POST method only
         if (!HttpMethods.IsPost(context.Request.Method))
         {
+            Log(SeverityWarning,
+                $"Rejected non-POST method '{context.Request.Method}'.",
+                requestId, "response");
             context.Response.StatusCode = StatusCodes.Status501NotImplemented;
             return;
         }
@@ -90,57 +109,36 @@ public class Function : IHttpFunction
         // - x-pbi-dataset-name : The name of the semantic model to send the query against
         if (!context.Request.Headers.TryGetValue("x-pbi-tenant-id", out var tenantId))
         {
-            var errorResponse = new
-            {
-                error = "Invalid header",
-                detail = "x-pbi-tenant-id header is required"
-            };
-
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid header", detail: "x-pbi-tenant-id header is required");
             return;
         }
 
         if (!context.Request.Headers.TryGetValue("x-pbi-client-id", out var clientId))
         {
-            var errorResponse = new
-            {
-                error = "Invalid header",
-                detail = "x-pbi-client-id header is required"
-            };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid header", detail: "x-pbi-client-id header is required");
             return;
         }
 
         if (!context.Request.Headers.TryGetValue("x-pbi-client-secret", out var clientSecret))
         {
-            var errorResponse = new
-            {
-                error = "Invalid header",
-                detail = "x-pbi-client-secret header is required"
-            };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid header", detail: "x-pbi-client-secret header is required");
             return;
         }
 
         if (!context.Request.Headers.TryGetValue("x-pbi-xmla-endpoint", out var xmlaEndpoint))
         {
-            var errorResponse = new
-            {
-                error = "Invalid header",
-                detail = "x-pbi-xmla-endpoint header is required"
-            };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid header", detail: "x-pbi-xmla-endpoint header is required");
             return;
         }
 
         if (!context.Request.Headers.TryGetValue("x-pbi-dataset-name", out var datasetName))
         {
-            var errorResponse = new
-            {
-                error = "Invalid header",
-                detail = "x-pbi-dataset-name header is required"
-            };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid header", detail: "x-pbi-dataset-name header is required");
             return;
         }
 
@@ -157,13 +155,8 @@ public class Function : IHttpFunction
         // If queries are missing, return a 400 Bad Request response
         if (string.IsNullOrWhiteSpace(bodyRaw))
         {
-
-            var errorResponse = new
-            {
-                error = "Invalid body",
-                detail = "Request body is required"
-            };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid body", detail: "Request body is required");
             return;
         }
 
@@ -171,14 +164,14 @@ public class Function : IHttpFunction
 
         if (body?.Queries == null || body.Queries.Count == 0 || string.IsNullOrWhiteSpace(body.Queries[0]?.Query))
         {
-            var errorResponse = new
-            {
-                error = "Invalid body",
-                detail = "Request body must contain at least one Query"
-            };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid body", detail: "Request body must contain at least one Query");
             return;
         }
+
+        Log(SeverityInfo,
+            $"Request body parsed: {body.Queries.Count} query(ies).",
+            requestId, "body_parse");
 
         // Create ADOMD connection.
         // EffectiveUserName is only included when a non-empty impersonatedUserName is provided.
@@ -199,7 +192,10 @@ public class Function : IHttpFunction
                     return true;
                 },
                 operationName: "connection open",
+                requestId: requestId,
                 cancellationToken: context.RequestAborted);
+
+            Log(SeverityInfo, "XMLA connection opened.", requestId, "connection_open");
 
             var allGood = true;
 
@@ -211,12 +207,14 @@ public class Function : IHttpFunction
             for (var queryIndex = 0; queryIndex < body.Queries.Count; queryIndex++)
             {
                 var queryItem = body.Queries[queryIndex];
+                var operationName = $"query execution ({queryIndex + 1}/{body.Queries.Count})";
                 using var command = new AdomdCommand(queryItem.Query, connection);
                 try
                 {
                     using var reader = await ExecuteWithRetryAsync(
                         operation: () => command.ExecuteReader(),
-                        operationName: $"query execution ({queryIndex + 1}/{body.Queries.Count})",
+                        operationName: operationName,
+                        requestId: requestId,
                         cancellationToken: context.RequestAborted);
                     var rows = new List<Dictionary<string, object>>();
 
@@ -237,6 +235,10 @@ public class Function : IHttpFunction
                             new { rows }
                         }
                     });
+
+                    Log(SeverityInfo,
+                        $"Query {queryIndex + 1}/{body.Queries.Count} executed: {rows.Count} row(s).",
+                        requestId, "query_execution", operationName: operationName);
                 }
                 catch (AdomdErrorResponseException ex)
                 {
@@ -249,6 +251,10 @@ public class Function : IHttpFunction
                             message = ex.Message
                         }
                     });
+                    Log(SeverityWarning,
+                        $"Query {queryIndex + 1}/{body.Queries.Count} returned a model error.",
+                        requestId, "query_execution", operationName: operationName,
+                        exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
                 }
                 catch (AdomdException ex)
                 {
@@ -261,11 +267,16 @@ public class Function : IHttpFunction
                             message = ex.Message
                         }
                     });
+                    Log(SeverityWarning,
+                        $"Query {queryIndex + 1}/{body.Queries.Count} failed with an ADOMD error.",
+                        requestId, "query_execution", operationName: operationName,
+                        exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
                 }
             }
 
             // Closing the connection to Pbi XMLA endpoint
             connection.Close();
+            Log(SeverityInfo, "XMLA connection closed.", requestId, "connection_close");
 
             // The powerbi executeQueries response return 200 OK only if all queries are sucessful
             // If any query fails, the response is 400 Bad Request
@@ -278,23 +289,70 @@ public class Function : IHttpFunction
                 results
             };
             await context.Response.WriteAsync(JsonSerializer.Serialize(response));
+            Log(SeverityInfo,
+                $"Response sent with status {context.Response.StatusCode}.",
+                requestId, "response");
             return;
         }
         catch (Exception ex)
         {
-            context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            var callerAborted = context.RequestAborted.IsCancellationRequested;
+            var statusCode = ClassifyTopLevelStatusCode(ex, callerAborted);
+            context.Response.StatusCode = statusCode;
+
+            if (statusCode == Status499ClientClosedRequest)
+            {
+                // The caller disconnected before we finished. Set the status, write no
+                // body, and swallow any failure that arises from the gone client.
+                Log(SeverityInfo,
+                    "Caller closed the request before completion.",
+                    requestId, "error",
+                    exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
+                try
+                {
+                    // No body is written for 499; nothing further to flush.
+                }
+                catch
+                {
+                    // Intentionally ignored: the client is already gone.
+                }
+                return;
+            }
+
+            Log(SeverityError,
+                "An unhandled error occurred while processing the request.",
+                requestId, "error",
+                exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
+
             var errorResponse = new
             {
                 error = "An unhandled error occurred",
-                detail = $"{ex.Message}"
+                detail = $"{ex.Message}",
+                requestId,
+                exceptionType = ex.GetType().FullName
             };
-            await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            try
+            {
+                await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
+            }
+            catch
+            {
+                // Intentionally ignored: the client may have disconnected mid-write.
+            }
             return;
         }
         finally
         {
             connection.Close();
         }
+    }
+
+    private static async Task WriteValidationFailureAsync(
+        HttpContext context, string requestId, string error, string detail)
+    {
+        Log(SeverityWarning, $"{error}: {detail}", requestId, "body_parse");
+        var errorResponse = new { error, detail };
+        await context.Response.WriteAsync(JsonSerializer.Serialize(errorResponse));
     }
 
     private static RetryPolicySettings LoadRetryPolicySettings()
@@ -337,6 +395,7 @@ public class Function : IHttpFunction
     private static async Task<T> ExecuteWithRetryAsync<T>(
         Func<T> operation,
         string operationName,
+        string requestId,
         CancellationToken cancellationToken)
     {
         for (var attempt = 1; attempt <= RetryPolicy.MaxAttempts; attempt++)
@@ -348,23 +407,30 @@ public class Function : IHttpFunction
                 var result = operation();
                 if (attempt > 1)
                 {
-                    Console.WriteLine($"XMLA retry success: {operationName} succeeded on attempt {attempt}/{RetryPolicy.MaxAttempts}.");
+                    Log(SeverityInfo,
+                        $"{operationName} succeeded on attempt {attempt}/{RetryPolicy.MaxAttempts}.",
+                        requestId, "retry", operationName: operationName,
+                        attempt: attempt, maxAttempts: RetryPolicy.MaxAttempts);
                 }
                 return result;
             }
-            catch (Exception ex) when (IsTransientFailure(ex) && attempt < RetryPolicy.MaxAttempts)
+            catch (Exception ex) when (IsTransientFailure(ex, cancellationToken) && attempt < RetryPolicy.MaxAttempts)
             {
                 var delay = GetRetryDelay(attempt);
-                Console.WriteLine(
-                    $"XMLA transient failure: {operationName} attempt {attempt}/{RetryPolicy.MaxAttempts} failed. " +
-                    $"Retrying in {delay.TotalSeconds:F1}s. Reason: {GetShortExceptionMessage(ex)}");
+                Log(SeverityWarning,
+                    $"{operationName} attempt {attempt}/{RetryPolicy.MaxAttempts} failed; retrying in {delay.TotalSeconds:F1}s.",
+                    requestId, "retry", operationName: operationName,
+                    attempt: attempt, maxAttempts: RetryPolicy.MaxAttempts,
+                    exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
                 await Task.Delay(delay, cancellationToken);
             }
-            catch (Exception ex) when (IsTransientFailure(ex))
+            catch (Exception ex) when (IsTransientFailure(ex, cancellationToken))
             {
-                Console.WriteLine(
-                    $"XMLA transient failure exhausted: {operationName} attempt {attempt}/{RetryPolicy.MaxAttempts} failed. " +
-                    $"Reason: {GetShortExceptionMessage(ex)}");
+                Log(SeverityError,
+                    $"{operationName} attempt {attempt}/{RetryPolicy.MaxAttempts} failed; retry policy exhausted.",
+                    requestId, "retry", operationName: operationName,
+                    attempt: attempt, maxAttempts: RetryPolicy.MaxAttempts,
+                    exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
                 throw;
             }
         }
@@ -380,11 +446,14 @@ public class Function : IHttpFunction
         return baseDelay + TimeSpan.FromMilliseconds(jitterMilliseconds);
     }
 
-    private static bool IsTransientFailure(Exception ex)
+    private static bool IsTransientFailure(Exception ex, CancellationToken cancellationToken)
     {
+        // A cancellation is transient only when it did NOT originate from the caller.
+        // A dependency-side XMLA cancel ("A task was canceled") while the caller is still
+        // connected should be retried; a caller-aborted request should not.
         if (ex is OperationCanceledException)
         {
-            return false;
+            return !cancellationToken.IsCancellationRequested;
         }
 
         if (TryGetExceptionInChain<TimeoutException>(ex, out _))
@@ -413,6 +482,77 @@ public class Function : IHttpFunction
         return TransientMessageMarkers.Any(marker => message.Contains(marker))
             || TransientStatusCodeRegex.IsMatch(message);
     }
+
+    /// <summary>
+    /// Maps a top-level (unhandled) exception to an HTTP status code. Ordered, first match
+    /// wins, and TYPE-DRIVEN only — message markers and the transient status-code regex are
+    /// deliberately NOT consulted here (they belong to the retry decision, not status mapping).
+    /// </summary>
+    private static int ClassifyTopLevelStatusCode(Exception ex, bool callerAborted)
+    {
+        // 1. Caller closed the connection while a cancellation propagated -> 499.
+        if (callerAborted && TryGetExceptionInChain<OperationCanceledException>(ex, out _))
+        {
+            return Status499ClientClosedRequest;
+        }
+
+        // 2. A timeout, or a (non-caller) cancellation, surfaced as a gateway timeout -> 504.
+        if (TryGetExceptionInChain<TimeoutException>(ex, out _)
+            || TryGetExceptionInChain<OperationCanceledException>(ex, out _))
+        {
+            return StatusCodes.Status504GatewayTimeout;
+        }
+
+        // 3. Dependency/transport faults (ADOMD incl. AdomdConnectionException, sockets,
+        //    IO, HTTP) -> 502 Bad Gateway.
+        if (TryGetExceptionInChain<AdomdException>(ex, out _)
+            || TryGetExceptionInChain<System.Net.Sockets.SocketException>(ex, out _)
+            || TryGetExceptionInChain<IOException>(ex, out _)
+            || TryGetExceptionInChain<System.Net.Http.HttpRequestException>(ex, out _))
+        {
+            return StatusCodes.Status502BadGateway;
+        }
+
+        // 4. Anything else -> 500.
+        return StatusCodes.Status500InternalServerError;
+    }
+
+    /// <summary>
+    /// Writes a single-line JSON log entry to stdout for Cloud Logging. The "severity" and
+    /// "message" fields are promoted by Cloud Logging. Message/exception text is stripped of
+    /// CR/LF so each entry stays on one line. The connection string, secrets and raw headers
+    /// are never passed in by callers and must never be logged.
+    /// </summary>
+    private static void Log(
+        string severity,
+        string message,
+        string requestId,
+        string phase,
+        string operationName = null,
+        int? attempt = null,
+        int? maxAttempts = null,
+        string exceptionType = null,
+        string exceptionMessage = null)
+    {
+        var entry = new Dictionary<string, object>
+        {
+            ["severity"] = severity,
+            ["message"] = StripNewlines(message),
+            ["requestId"] = requestId,
+            ["phase"] = phase
+        };
+
+        if (operationName != null) entry["operationName"] = operationName;
+        if (attempt.HasValue) entry["attempt"] = attempt.Value;
+        if (maxAttempts.HasValue) entry["maxAttempts"] = maxAttempts.Value;
+        if (exceptionType != null) entry["exceptionType"] = exceptionType;
+        if (exceptionMessage != null) entry["exceptionMessage"] = StripNewlines(exceptionMessage);
+
+        Console.WriteLine(JsonSerializer.Serialize(entry));
+    }
+
+    private static string StripNewlines(string value)
+        => value?.Replace("\r", " ").Replace("\n", " ");
 
     private static string GetShortExceptionMessage(Exception ex)
     {

@@ -4,6 +4,13 @@
     <TargetFramework>net8.0</TargetFramework>
   </PropertyGroup>
 
+  <!-- The test project lives in a subdirectory of this project, so the SDK's default
+       **/*.cs globbing would otherwise pull its sources (and generated obj files) into
+       this assembly. Exclude the entire test subtree from compilation. -->
+  <ItemGroup>
+    <Compile Remove="celesta-bi-pbi-xmla-proxy.Tests\**\*.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Azure.Identity" Version="1.15.0" />
     <PackageReference Include="Microsoft.Identity.Client" Version="4.76.0" />

@@ -49,6 +49,43 @@ The `Function.cs` implements an HTTP-triggered Google Cloud Function that:
 
 Returns JSON responses matching the Power BI executeQueries API format, with query results organized in tables and rows structure. Handles both successful query execution and error scenarios with appropriate HTTP status codes.
 
+Every response — success, validation failure, or error — carries an `x-request-id` header containing a per-request GUID. The same id appears in the structured logs (see below) and, for `5xx` responses, in the JSON body, so a caller can correlate a failed call with its server-side logs.
+
+### HTTP status codes
+
+| Status | Meaning |
+| --- | --- |
+| `200 OK` | All queries executed successfully. |
+| `400 Bad Request` | Request validation failed (missing/invalid header or body), **or** at least one query returned a model/ADOMD error (the PBI-compatible per-query error contract; the `results[]` array reports which queries failed). |
+| `499 Client Closed Request` | The caller disconnected before the response completed. No body is returned. |
+| `500 Internal Server Error` | An unclassified unhandled error. |
+| `501 Not Implemented` | The request used a method other than `POST`. |
+| `502 Bad Gateway` | A dependency/transport fault talking to the XMLA endpoint (ADOMD, socket, IO or HTTP error). |
+| `504 Gateway Timeout` | The upstream operation timed out, or a non-caller cancellation occurred. |
+
+`5xx` responses use the body shape `{ "error", "detail", "requestId", "exceptionType" }`. Top-level status classification is **type-driven** (based on the exception type in the chain), not derived from message text.
+
+### Structured logging
+
+The function writes single-line JSON log entries to stdout, which Cloud Logging ingests directly. The `severity` and `message` fields are promoted by Cloud Logging.
+
+Fields: `severity`, `message`, `requestId`, `phase`, and where applicable `operationName`, `attempt`, `maxAttempts`, `exceptionType`, `exceptionMessage`. The connection string, the `x-pbi-client-secret` header, and raw request headers are never logged.
+
+Phases (`phase`): `handler_entry`, `body_parse`, `connection_open`, `query_execution`, `connection_close`, `retry`, `response`, `error`.
+
+Severities: `INFO` for normal phases and the `499` case; `WARNING` for each retry attempt and for validation failures (`400`/`501`); `ERROR` for retry exhaustion and top-level `5xx` errors.
+
+### Retry behaviour
+
+Transient failures opening the connection or executing a query are retried with exponential-style backoff and jitter. Cancellations are classified at the point of failure: a dependency-side cancellation while the caller is still connected is treated as transient (retried), whereas a caller-aborted request is not retried.
+
+Two environment variables tune the policy:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PBI_XMLA_RETRY_MAX_ATTEMPTS` | `4` | Maximum number of attempts (including the first) per operation. |
+| `PBI_XMLA_RETRY_BACKOFF_SECONDS` | `5,10,30` | Comma-separated backoff delays in seconds. The last value is reused once exhausted; a small random jitter is added to each delay. |
+
 ## Deployment on GCP
 ```shell
 ## Change project
