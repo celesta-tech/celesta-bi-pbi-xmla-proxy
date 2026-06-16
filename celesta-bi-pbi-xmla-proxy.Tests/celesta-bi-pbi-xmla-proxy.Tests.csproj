@@ -18,4 +18,11 @@
   <ItemGroup>
     <ProjectReference Include="..\celesta-bi-pbi-xmla-proxy.csproj" />
   </ItemGroup>
+
+  <!-- xunit only honors xunit.runner.json when it sits next to the test assembly in the
+       output directory. Several tests disable parallelism (e.g. swapping Console.Out), so
+       this copy is required for that config to take effect. -->
+  <ItemGroup>
+    <None Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

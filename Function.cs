@@ -302,20 +302,12 @@ public class Function : IHttpFunction
 
             if (statusCode == Status499ClientClosedRequest)
             {
-                // The caller disconnected before we finished. Set the status, write no
-                // body, and swallow any failure that arises from the gone client.
+                // The caller disconnected before we finished. Setting the status code is
+                // sufficient: no body is written, so there is nothing here that can fail.
                 Log(SeverityInfo,
                     "Caller closed the request before completion.",
                     requestId, "error",
                     exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
-                try
-                {
-                    // No body is written for 499; nothing further to flush.
-                }
-                catch
-                {
-                    // Intentionally ignored: the client is already gone.
-                }
                 return;
             }
 
