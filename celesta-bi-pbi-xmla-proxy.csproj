@@ -11,6 +11,13 @@
     <Compile Remove="celesta-bi-pbi-xmla-proxy.Tests\**\*.cs" />
   </ItemGroup>
 
+  <!-- Expose the internal XMLA seam (interfaces + the internal Function constructor) to the
+       test project so tests can inject a fake connection. This is the only use of internal
+       visibility; production callers still see only the public surface. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="celesta-bi-pbi-xmla-proxy.Tests" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Azure.Identity" Version="1.15.0" />
     <PackageReference Include="Microsoft.Identity.Client" Version="4.76.0" />

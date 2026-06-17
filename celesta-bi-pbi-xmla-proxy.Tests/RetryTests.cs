@@ -1,173 +1,72 @@
+using Celesta.Bi.Pbi.XmlaProxy.Tests.TestInfrastructure;
 using FluentAssertions;
+using Microsoft.AspNetCore.Http;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
-using Celesta.Bi.Pbi.XmlaProxy.Tests.TestInfrastructure;
 
 namespace Celesta.Bi.Pbi.XmlaProxy.Tests;
 
+/// <summary>
+/// Retry behaviour, driven black-box through HandleAsync with a fake connection whose Open()
+/// fails in controlled ways. (MaxAttempts is forced to 3 with 1s backoff by TestEnvironment.)
+/// </summary>
 public class RetryTests
 {
-    private const string TestRequestId = "test-request-id";
-
     [Fact]
-    public async Task Transient_then_success_retries_and_returns()
+    public async Task Dependency_cancellation_retries_then_succeeds()
     {
-        var attempts = 0;
+        // A dependency-side cancellation (caller token NOT aborted) is transient: fail twice, then succeed.
+        var fake = new FakeXmlaConnection(
+            onOpen: attempt => attempt <= 2 ? new TaskCanceledException("A task was canceled.") : null);
+        var sut = new Function(fake.AsFactory());
+        var context = HttpContextFactory.CreateValidPostContext();
 
-        var result = await FunctionReflectionBridge.ExecuteWithRetryAsync(
-            operation: () =>
-            {
-                attempts++;
-                if (attempts < 3)
-                {
-                    throw new TimeoutException("transient timeout");
-                }
+        await sut.HandleAsync(context);
 
-                return true;
-            },
-            operationName: "retry-success",
-            requestId: TestRequestId,
-            cancellationToken: CancellationToken.None);
-
-        result.Should().BeTrue();
-        attempts.Should().Be(3);
+        context.Response.StatusCode.Should().Be(StatusCodes.Status200OK);
+        fake.OpenCalls.Should().Be(3);
     }
 
     [Fact]
-    public async Task Transient_exhausted_throws_after_max_attempts()
+    public async Task Transient_failure_exhausts_retries_and_returns_504()
     {
-        var attempts = 0;
+        var fake = new FakeXmlaConnection(onOpen: _ => new TimeoutException("always times out"));
+        var sut = new Function(fake.AsFactory());
+        var context = HttpContextFactory.CreateValidPostContext();
 
-        Func<Task> action = async () =>
-            await FunctionReflectionBridge.ExecuteWithRetryAsync<bool>(
-                operation: () =>
-                {
-                    attempts++;
-                    throw new TimeoutException("always timeout");
-                },
-                operationName: "retry-exhausted",
-                requestId: TestRequestId,
-                cancellationToken: CancellationToken.None);
+        await sut.HandleAsync(context);
 
-        await action.Should().ThrowAsync<TimeoutException>();
-        attempts.Should().Be(3);
+        context.Response.StatusCode.Should().Be(StatusCodes.Status504GatewayTimeout);
+        fake.OpenCalls.Should().Be(3);
     }
 
     [Fact]
-    public async Task Non_transient_fails_without_retry()
+    public async Task Caller_cancellation_is_not_retried_and_returns_499()
     {
-        var attempts = 0;
+        // Even though the failure would be transient, a caller-aborted request must not retry.
+        var fake = new FakeXmlaConnection(onOpen: _ => new TimeoutException("would be transient"));
+        var sut = new Function(fake.AsFactory());
+        var context = HttpContextFactory.CreateValidPostContext();
+        context.RequestAborted = new CancellationToken(canceled: true);
 
-        Func<Task> action = async () =>
-            await FunctionReflectionBridge.ExecuteWithRetryAsync<bool>(
-                operation: () =>
-                {
-                    attempts++;
-                    throw new InvalidOperationException("semantic/model error");
-                },
-                operationName: "non-transient",
-                requestId: TestRequestId,
-                cancellationToken: CancellationToken.None);
+        await sut.HandleAsync(context);
 
-        await action.Should().ThrowAsync<InvalidOperationException>()
-            .WithMessage("*semantic/model error*");
-        attempts.Should().Be(1);
+        context.Response.StatusCode.Should().Be(499);
+        fake.OpenCalls.Should().Be(0); // the loop-top guard throws before the operation runs
     }
 
     [Fact]
-    public async Task Immediate_success_no_retry()
+    public async Task Non_transient_open_error_is_not_retried_and_returns_500()
     {
-        var attempts = 0;
+        var fake = new FakeXmlaConnection(onOpen: _ => new InvalidOperationException("boom"));
+        var sut = new Function(fake.AsFactory());
+        var context = HttpContextFactory.CreateValidPostContext();
 
-        var result = await FunctionReflectionBridge.ExecuteWithRetryAsync(
-            operation: () =>
-            {
-                attempts++;
-                return "ok";
-            },
-            operationName: "immediate-success",
-            requestId: TestRequestId,
-            cancellationToken: CancellationToken.None);
+        await sut.HandleAsync(context);
 
-        result.Should().Be("ok");
-        attempts.Should().Be(1);
-    }
-
-    [Fact]
-    public async Task Cancellation_aborts_retry()
-    {
-        var attempts = 0;
-        using var cts = new CancellationTokenSource();
-        using var firstAttemptObserved = new ManualResetEventSlim(initialState: false);
-
-        var retryTask = FunctionReflectionBridge.ExecuteWithRetryAsync<bool>(
-            operation: () =>
-            {
-                attempts++;
-                firstAttemptObserved.Set();
-                throw new TimeoutException("cancel during backoff");
-            },
-            operationName: "cancellation",
-            requestId: TestRequestId,
-            cancellationToken: cts.Token);
-
-        firstAttemptObserved.Wait(TimeSpan.FromSeconds(2)).Should().BeTrue("the first attempt should have started");
-        cts.Cancel();
-
-        Func<Task> action = async () => await retryTask;
-        await action.Should().ThrowAsync<OperationCanceledException>();
-        attempts.Should().Be(1);
-    }
-
-    [Fact]
-    public async Task Dependency_cancellation_is_transient_and_retries()
-    {
-        // A dependency-side cancellation (e.g. the XMLA endpoint cancels a task) surfaces as a
-        // TaskCanceledException while the caller's token is NOT cancelled. It must be retried.
-        var attempts = 0;
-
-        var result = await FunctionReflectionBridge.ExecuteWithRetryAsync(
-            operation: () =>
-            {
-                attempts++;
-                if (attempts < 2)
-                {
-                    throw new TaskCanceledException("A task was canceled.");
-                }
-
-                return true;
-            },
-            operationName: "dependency-cancel",
-            requestId: TestRequestId,
-            cancellationToken: CancellationToken.None);
-
-        result.Should().BeTrue();
-        attempts.Should().Be(2);
-    }
-
-    [Fact]
-    public async Task Caller_cancellation_does_not_retry()
-    {
-        // A pre-cancelled token means the caller aborted: the loop-top guard throws before the
-        // operation ever runs, so there are zero attempts and no retry.
-        var attempts = 0;
-        using var cts = new CancellationTokenSource();
-        cts.Cancel();
-
-        Func<Task> action = async () =>
-            await FunctionReflectionBridge.ExecuteWithRetryAsync<bool>(
-                operation: () =>
-                {
-                    attempts++;
-                    return true;
-                },
-                operationName: "caller-cancel",
-                requestId: TestRequestId,
-                cancellationToken: cts.Token);
-
-        await action.Should().ThrowAsync<OperationCanceledException>();
-        attempts.Should().Be(0);
+        context.Response.StatusCode.Should().Be(StatusCodes.Status500InternalServerError);
+        fake.OpenCalls.Should().Be(1);
     }
 }

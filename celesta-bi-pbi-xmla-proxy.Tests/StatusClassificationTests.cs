@@ -1,88 +1,69 @@
 using Celesta.Bi.Pbi.XmlaProxy.Tests.TestInfrastructure;
+using Celesta.Bi.Pbi.XmlaProxy.Xmla;
 using FluentAssertions;
+using Microsoft.AspNetCore.Http;
 using System;
 using System.IO;
 using System.Net.Http;
 using System.Net.Sockets;
-using System.Threading;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace Celesta.Bi.Pbi.XmlaProxy.Tests;
 
+/// <summary>
+/// Top-level status-code classification, observed black-box: each test makes Open() throw a
+/// given exception and asserts the resulting HTTP status. Classification is type-driven.
+/// </summary>
 public class StatusClassificationTests
 {
-    [Fact]
-    public void TimeoutException_maps_to_504()
+    private static async Task<int> StatusWhenOpenThrows(Exception exception)
     {
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new TimeoutException("operation timed out"), callerAborted: false)
-            .Should().Be(504);
+        var fake = new FakeXmlaConnection(onOpen: _ => exception);
+        var sut = new Function(fake.AsFactory());
+        var context = HttpContextFactory.CreateValidPostContext();
+
+        await sut.HandleAsync(context);
+
+        return context.Response.StatusCode;
     }
 
     [Fact]
-    public void Non_caller_cancellation_maps_to_504()
-    {
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new OperationCanceledException("A task was canceled."), callerAborted: false)
-            .Should().Be(504);
-    }
+    public async Task Non_caller_cancellation_maps_to_504()
+        => (await StatusWhenOpenThrows(new OperationCanceledException("A task was canceled.")))
+            .Should().Be(StatusCodes.Status504GatewayTimeout);
 
     [Fact]
-    public void Caller_cancellation_maps_to_499()
-    {
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new OperationCanceledException("A task was canceled."), callerAborted: true)
-            .Should().Be(499);
-    }
+    public async Task SocketException_maps_to_502()
+        => (await StatusWhenOpenThrows(new SocketException()))
+            .Should().Be(StatusCodes.Status502BadGateway);
 
     [Fact]
-    public void Caller_cancellation_takes_precedence_over_timeout()
-    {
-        // A cancellation wrapping a timeout, with the caller aborted, is still a 499.
-        var ex = new OperationCanceledException("canceled", new TimeoutException("timed out"));
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(ex, callerAborted: true)
-            .Should().Be(499);
-    }
+    public async Task IOException_maps_to_502()
+        => (await StatusWhenOpenThrows(new IOException("connection forcibly closed")))
+            .Should().Be(StatusCodes.Status502BadGateway);
 
     [Fact]
-    public void SocketException_maps_to_502()
-    {
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new SocketException(), callerAborted: false)
-            .Should().Be(502);
-    }
+    public async Task HttpRequestException_maps_to_502()
+        => (await StatusWhenOpenThrows(new HttpRequestException("transport error")))
+            .Should().Be(StatusCodes.Status502BadGateway);
 
     [Fact]
-    public void IOException_maps_to_502()
-    {
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new IOException("connection forcibly closed"), callerAborted: false)
-            .Should().Be(502);
-    }
+    public async Task Translated_xmla_error_maps_to_502()
+        => (await StatusWhenOpenThrows(new XmlaException("connection refused", new Exception("inner"))))
+            .Should().Be(StatusCodes.Status502BadGateway);
 
     [Fact]
-    public void HttpRequestException_maps_to_502()
-    {
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new HttpRequestException("transport error"), callerAborted: false)
-            .Should().Be(502);
-    }
+    public async Task Generic_exception_maps_to_500()
+        => (await StatusWhenOpenThrows(new InvalidOperationException("something went wrong")))
+            .Should().Be(StatusCodes.Status500InternalServerError);
 
     [Fact]
-    public void Generic_exception_maps_to_500()
+    public async Task Generic_exception_with_misleading_text_still_maps_to_500()
     {
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new InvalidOperationException("something went wrong"), callerAborted: false)
-            .Should().Be(500);
-    }
-
-    [Fact]
-    public void Generic_exception_with_misleading_text_still_maps_to_500()
-    {
-        // Classification is TYPE-driven, not text-driven: a "504"/"timeout" message on a
-        // generic exception must NOT be promoted to 504.
-        FunctionReflectionBridge.ClassifyTopLevelStatusCode(
-            new InvalidOperationException("received 504 gateway timeout"), callerAborted: false)
-            .Should().Be(500);
+        // Classification is TYPE-driven, not text-driven: a "504"/"timeout" message on a generic
+        // exception must NOT be promoted to 504 (even though the retry layer may treat it as transient).
+        (await StatusWhenOpenThrows(new InvalidOperationException("received 504 gateway timeout")))
+            .Should().Be(StatusCodes.Status500InternalServerError);
     }
 }

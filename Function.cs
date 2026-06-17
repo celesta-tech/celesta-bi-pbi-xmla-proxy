@@ -2,7 +2,7 @@ using Google.Cloud.Functions.Framework;
 using Microsoft.AspNetCore.Http;
 using System;
 using System.Threading.Tasks;
-using Microsoft.AnalysisServices.AdomdClient;
+using Celesta.Bi.Pbi.XmlaProxy.Xmla;
 using System.Text.Json;
 using System.IO;
 using System.Collections.Generic;
@@ -34,6 +34,19 @@ public sealed class QueryItem
 
 public class Function : IHttpFunction
 {
+    private readonly IXmlaConnectionFactory _connectionFactory;
+
+    /// <summary>Production constructor used by the Functions Framework: connects via real ADOMD.</summary>
+    public Function() : this(new AdomdXmlaConnectionFactory())
+    {
+    }
+
+    /// <summary>Test seam: injects an XMLA connection factory (e.g. a fake) without a live endpoint.</summary>
+    internal Function(IXmlaConnectionFactory connectionFactory)
+    {
+        _connectionFactory = connectionFactory;
+    }
+
     private static readonly string[] AuthScopes = ["https://analysis.windows.net/powerbi/api/.default"];
     private static readonly RetryPolicySettings RetryPolicy = LoadRetryPolicySettings();
     private static readonly HttpStatusCode[] TransientHttpStatusCodes =
@@ -68,6 +81,9 @@ public class Function : IHttpFunction
     private const string SeverityInfo = "INFO";
     private const string SeverityWarning = "WARNING";
     private const string SeverityError = "ERROR";
+
+    // The PBI executeQueries payload uses lowercase property names; accept them case-insensitively.
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     /// <summary>
     /// Mimic the PowerBI service endpoint to execute DAX queries against a PowerBI dataset using XMLA endpoint.
@@ -160,7 +176,9 @@ public class Function : IHttpFunction
             return;
         }
 
-        var body = JsonSerializer.Deserialize<ExecuteQueryRequestPayload>(bodyRaw);
+        // The Power BI executeQueries contract uses lowercase property names (queries/query),
+        // so deserialization must be case-insensitive to accept a standard payload.
+        var body = JsonSerializer.Deserialize<ExecuteQueryRequestPayload>(bodyRaw, JsonOptions);
 
         if (body?.Queries == null || body.Queries.Count == 0 || string.IsNullOrWhiteSpace(body.Queries[0]?.Query))
         {
@@ -180,7 +198,7 @@ public class Function : IHttpFunction
         {
             connectionString += $"EffectiveUserName={body.ImpersonatedUserName};";
         }
-        using AdomdConnection connection = new(connectionString);
+        using IXmlaConnection connection = _connectionFactory.Create(connectionString);
 
         try
         {
@@ -208,7 +226,7 @@ public class Function : IHttpFunction
             {
                 var queryItem = body.Queries[queryIndex];
                 var operationName = $"query execution ({queryIndex + 1}/{body.Queries.Count})";
-                using var command = new AdomdCommand(queryItem.Query, connection);
+                using var command = connection.CreateCommand(queryItem.Query);
                 try
                 {
                     using var reader = await ExecuteWithRetryAsync(
@@ -240,7 +258,7 @@ public class Function : IHttpFunction
                         $"Query {queryIndex + 1}/{body.Queries.Count} executed: {rows.Count} row(s).",
                         requestId, "query_execution", operationName: operationName);
                 }
-                catch (AdomdErrorResponseException ex)
+                catch (XmlaModelQueryException ex)
                 {
                     allGood = false;
                     results.Add(new
@@ -256,7 +274,7 @@ public class Function : IHttpFunction
                         requestId, "query_execution", operationName: operationName,
                         exceptionType: ex.GetType().FullName, exceptionMessage: GetShortExceptionMessage(ex));
                 }
-                catch (AdomdException ex)
+                catch (XmlaException ex)
                 {
                     allGood = false;
                     results.Add(new
@@ -495,9 +513,9 @@ public class Function : IHttpFunction
             return StatusCodes.Status504GatewayTimeout;
         }
 
-        // 3. Dependency/transport faults (ADOMD incl. AdomdConnectionException, sockets,
-        //    IO, HTTP) -> 502 Bad Gateway.
-        if (TryGetExceptionInChain<AdomdException>(ex, out _)
+        // 3. Dependency/transport faults (translated XMLA errors, sockets, IO, HTTP) -> 502
+        //    Bad Gateway.
+        if (TryGetExceptionInChain<XmlaException>(ex, out _)
             || TryGetExceptionInChain<System.Net.Sockets.SocketException>(ex, out _)
             || TryGetExceptionInChain<IOException>(ex, out _)
             || TryGetExceptionInChain<System.Net.Http.HttpRequestException>(ex, out _))

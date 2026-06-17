@@ -29,6 +29,14 @@ internal static class HttpContextFactory
         return context;
     }
 
+    /// <summary>A POST with all required headers and a single valid query — the starting point
+    /// for tests that exercise the connection/query path via an injected fake.</summary>
+    public static DefaultHttpContext CreateValidPostContext()
+        => CreateContext(
+            method: "POST",
+            body: """{ "queries": [ { "query": "EVALUATE ROW(\"A\", 1)" } ] }""",
+            headers: BuildRequiredHeaders());
+
     public static Dictionary<string, string> BuildRequiredHeaders() => new()
     {
         ["x-pbi-tenant-id"] = "tenant-id",
