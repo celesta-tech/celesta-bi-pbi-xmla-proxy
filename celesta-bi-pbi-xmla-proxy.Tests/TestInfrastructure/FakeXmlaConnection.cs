@@ -14,14 +14,14 @@ namespace Celesta.Bi.Pbi.XmlaProxy.Tests.TestInfrastructure;
 /// </summary>
 internal sealed class FakeXmlaConnection : IXmlaConnection
 {
-    private readonly Func<int, Exception> _onOpen;
-    private readonly Func<Exception> _onExecuteReader;
+    private readonly Func<int, Exception?> _onOpen;
+    private readonly Func<Exception?> _onExecuteReader;
     private readonly IReadOnlyList<IReadOnlyDictionary<string, object>> _rows;
 
     public FakeXmlaConnection(
-        Func<int, Exception> onOpen = null,
-        Func<Exception> onExecuteReader = null,
-        IReadOnlyList<IReadOnlyDictionary<string, object>> rows = null)
+        Func<int, Exception?>? onOpen = null,
+        Func<Exception?>? onExecuteReader = null,
+        IReadOnlyList<IReadOnlyDictionary<string, object>>? rows = null)
     {
         _onOpen = onOpen ?? (_ => null);
         _onExecuteReader = onExecuteReader ?? (() => null);
@@ -77,10 +77,10 @@ internal sealed class FakeXmlaConnectionFactory : IXmlaConnectionFactory
 
 internal sealed class FakeXmlaCommand : IXmlaCommand
 {
-    private readonly Func<Exception> _onExecuteReader;
+    private readonly Func<Exception?> _onExecuteReader;
     private readonly IReadOnlyList<IReadOnlyDictionary<string, object>> _rows;
 
-    public FakeXmlaCommand(Func<Exception> onExecuteReader, IReadOnlyList<IReadOnlyDictionary<string, object>> rows)
+    public FakeXmlaCommand(Func<Exception?> onExecuteReader, IReadOnlyList<IReadOnlyDictionary<string, object>> rows)
     {
         _onExecuteReader = onExecuteReader;
         _rows = rows;

@@ -50,6 +50,37 @@ public class QueryExecutionTests
     }
 
     [Fact]
+    public async Task Null_query_after_the_first_returns_400()
+    {
+        // A later null query must be rejected as a 400 up front, not slip through to a 500 at execution.
+        var fake = new FakeXmlaConnection();
+        var sut = new Function(fake.AsFactory());
+        var context = HttpContextFactory.CreateContext(
+            method: "POST",
+            body: """{ "queries": [ { "query": "EVALUATE ROW(\"A\", 1)" }, null ] }""",
+            headers: HttpContextFactory.BuildRequiredHeaders());
+
+        await sut.HandleAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status400BadRequest);
+    }
+
+    [Fact]
+    public async Task Empty_query_after_the_first_returns_400()
+    {
+        var fake = new FakeXmlaConnection();
+        var sut = new Function(fake.AsFactory());
+        var context = HttpContextFactory.CreateContext(
+            method: "POST",
+            body: """{ "queries": [ { "query": "EVALUATE ROW(\"A\", 1)" }, { "query": "" } ] }""",
+            headers: HttpContextFactory.BuildRequiredHeaders());
+
+        await sut.HandleAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status400BadRequest);
+    }
+
+    [Fact]
     public async Task Model_query_error_returns_400_with_model_error_code()
     {
         var fake = new FakeXmlaConnection(

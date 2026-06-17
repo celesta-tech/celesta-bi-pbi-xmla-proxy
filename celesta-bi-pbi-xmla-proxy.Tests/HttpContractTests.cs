@@ -94,4 +94,21 @@ public class HttpContractTests
 
         context.Response.ContentType.Should().Be("application/json");
     }
+
+    [Fact]
+    public async Task Malformed_json_body_returns_400()
+    {
+        var sut = new Function();
+        var context = HttpContextFactory.CreateContext(
+            method: "POST",
+            body: "{ not valid json",
+            headers: HttpContextFactory.BuildRequiredHeaders());
+
+        await sut.HandleAsync(context);
+        var responseBody = await HttpContextFactory.ReadResponseBodyAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status400BadRequest);
+        var json = JsonDocument.Parse(responseBody).RootElement;
+        json.GetProperty("error").GetString().Should().Be("Invalid body");
+    }
 }

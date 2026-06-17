@@ -178,12 +178,32 @@ public class Function : IHttpFunction
 
         // The Power BI executeQueries contract uses lowercase property names (queries/query),
         // so deserialization must be case-insensitive to accept a standard payload.
-        var body = JsonSerializer.Deserialize<ExecuteQueryRequestPayload>(bodyRaw, JsonOptions);
+        // Malformed JSON is a client error (400), not an unhandled server error (500).
+        ExecuteQueryRequestPayload body;
+        try
+        {
+            body = JsonSerializer.Deserialize<ExecuteQueryRequestPayload>(bodyRaw, JsonOptions);
+        }
+        catch (JsonException)
+        {
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid body", detail: "Request body is not valid JSON");
+            return;
+        }
 
-        if (body?.Queries == null || body.Queries.Count == 0 || string.IsNullOrWhiteSpace(body.Queries[0]?.Query))
+        if (body?.Queries == null || body.Queries.Count == 0)
         {
             await WriteValidationFailureAsync(context, requestId,
                 error: "Invalid body", detail: "Request body must contain at least one Query");
+            return;
+        }
+
+        // Validate every query, not just the first: a null item or null/empty query text must be
+        // rejected here rather than slip through and fail (500) when the command is built.
+        if (body.Queries.Any(queryItem => string.IsNullOrWhiteSpace(queryItem?.Query)))
+        {
+            await WriteValidationFailureAsync(context, requestId,
+                error: "Invalid body", detail: "Each query must contain a non-empty Query");
             return;
         }
 
