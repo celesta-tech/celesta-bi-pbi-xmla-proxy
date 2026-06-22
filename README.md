@@ -98,3 +98,24 @@ gcloud functions deploy executeQueries --gen2 --region=europe-west2 --runtime=do
 gcloud functions add-iam-policy-binding my-xmla-proxy --region=europe-west2 --member=serviceAccount:MY-SERVICE-ACCOUNT@YOUR_PROJECT.iam.gserviceaccount.com --role=roles/cloudfunctions.invoker
 
 ```
+
+## Releases & versioning
+
+This repo does not deploy itself. Instead, each release publishes an **immutable, versioned source artifact** that the Terraform deploy pipeline pins and deploys.
+
+### Versioning scheme
+
+Releases are cut as plain semver git tags of the form `vX.Y.Z` (e.g. `v0.1.0`). Pushing such a tag triggers the [`release` workflow](.github/workflows/release.yml), which:
+
+1. runs `dotnet test` — no artifact is published for a failing commit;
+2. packages the deployable **source zip** from the tagged tree, in the layout the GCP .NET buildpack expects: a single `.csproj` plus `Function.cs` at the zip root, with the test project and the `.sln` excluded;
+3. publishes the zip as an immutable asset on a GitHub Release for that tag. The tag and its asset are created exactly once.
+
+### Runtime contract
+
+The published artifact commits to the contract the deploy pipeline pins against:
+
+- **Entry point:** `Celesta.Bi.Pbi.XmlaProxy.Function` — the fully-qualified class implementing `IHttpFunction`, selected via Terraform `build_config.entry_point` / gcloud `--entry-point` (not a `FUNCTION_TARGET` environment variable).
+- **Runtime:** `dotnet8`.
+
+Deploying the zip is the responsibility of the private Terraform module, which mirrors the pinned version into a GCS source bucket at apply time.

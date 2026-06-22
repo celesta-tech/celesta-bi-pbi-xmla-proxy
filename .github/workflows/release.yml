@@ -1,0 +1,46 @@
+name: release
+
+# Tagging a semver version (vX.Y.Z) tests the code, packages the deployable
+# source zip in the layout the GCP .NET buildpack expects, and publishes it as
+# an immutable GitHub Release asset that the Terraform deploy pipeline (BI-522)
+# can pin against.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # create the release and upload the asset
+
+jobs:
+  release:
+    runs-on: ubuntu-latest # mirrors the Linux environment the GCP buildpack builds in
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Test
+        run: dotnet test -c Release
+
+      # git archive emits only tracked files (no bin/obj/.git) from the tagged
+      # tree. Exclude the test project (a second .csproj makes the buildpack
+      # ambiguous) and the .sln (it references the now-absent test project, so a
+      # solution-based build would fail). What remains is a single buildable
+      # project with .csproj + Function.cs at the zip root.
+      - name: Package source zip
+        run: |
+          git archive --format=zip -o "celesta-bi-pbi-xmla-proxy-${GITHUB_REF_NAME}.zip" HEAD \
+            -- . ':(exclude)celesta-bi-pbi-xmla-proxy.Tests' ':(exclude)*.sln' ':(exclude).github'
+
+      # gh release create fails if a release already exists for the tag, so the
+      # tag and its asset are created exactly once (immutable).
+      - name: Publish release
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "celesta-bi-pbi-xmla-proxy-${GITHUB_REF_NAME}.zip" \
+            --title "${GITHUB_REF_NAME}" --generate-notes
