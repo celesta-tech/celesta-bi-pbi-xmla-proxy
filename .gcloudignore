@@ -14,4 +14,10 @@
 .gitignore
 
 node_modules
+
+# Test project: kept in version control but NOT part of the deployed function.
+# Excluding it leaves a single .csproj in the upload so the .NET buildpack
+# knows which project to build (it errors if it finds more than one).
+celesta-bi-pbi-xmla-proxy.Tests/
+
 #!include:.gitignore
